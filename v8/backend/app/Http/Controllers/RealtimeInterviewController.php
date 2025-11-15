@@ -137,8 +137,14 @@ PROMPT;
         try {
             $apiKey = env('OPENAI_API_KEY');
             
-            // ✅ FIXED: Use gpt-5-mini (you have this model)
-            $model = 'gpt-5-mini';
+            // ✅ FIXED: Use actual OpenAI model
+            $model = 'gpt-4o-mini';
+
+            Log::info('Analyzing answer with AI', [
+                'model' => $model,
+                'question_length' => strlen($question),
+                'answer_length' => strlen($answer)
+            ]);
 
             $headers = ['Authorization' => 'Bearer ' . $apiKey];
 
@@ -167,6 +173,11 @@ PROMPT;
 
             $content = $res->json('choices.0.message.content') ?? '{}';
             
+            Log::info('AI feedback received', [
+                'content_length' => strlen($content),
+                'preview' => substr($content, 0, 100)
+            ]);
+            
             // Clean response
             $content = preg_replace('/```json\s*|\s*```/', '', $content);
             $content = trim($content);
@@ -174,9 +185,16 @@ PROMPT;
             $feedback = json_decode($content, true);
 
             if (!is_array($feedback) || !isset($feedback['clarity'])) {
-                Log::warning('Invalid feedback format', ['content' => $content]);
+                Log::warning('Invalid feedback format from AI', ['content' => $content]);
                 return $this->getFallbackFeedback($answer);
             }
+
+            Log::info('AI feedback successfully parsed', [
+                'clarity' => $feedback['clarity'] ?? 0,
+                'confidence' => $feedback['confidence'] ?? 0,
+                'structure' => $feedback['structure'] ?? 0,
+                'relevance' => $feedback['relevance'] ?? 0
+            ]);
 
             // Ensure all required fields exist
             return [
@@ -196,9 +214,12 @@ PROMPT;
 
     /**
      * Generate fallback feedback based on basic metrics
+     * This is only used when AI analysis fails
      */
     private function getFallbackFeedback(string $answer): array
     {
+        Log::warning('Using FALLBACK feedback (AI analysis failed)');
+        
         $wordCount = str_word_count($answer);
         $sentences = preg_split('/[.!?]+/', $answer, -1, PREG_SPLIT_NO_EMPTY);
         $sentenceCount = count($sentences);
@@ -223,7 +244,7 @@ PROMPT;
             'confidence' => (int) $confidenceScore,
             'structure' => (int) $structureScore,
             'relevance' => (int) $relevanceScore,
-            'summary' => "Based on basic analysis. Word count: {$wordCount}. Consider adding more detail and structure.",
+            'summary' => "⚠️ Basic analysis (AI unavailable). Word count: {$wordCount}. Consider adding more detail and structure.",
             'tips' => $tips
         ];
     }
