@@ -8,13 +8,16 @@ if (!OPENAI_API_KEY) {
   process.exit(1);
 }
 
-// ✅ FIXED: Use your actual model
 const MODEL = 'gpt-realtime';
 const PORT = 8081;
 
+// ⚙️ CONFIGURATION: Toggle AI follow-up questions
+const ENABLE_AI_FOLLOWUP = true; // Set to true to enable AI follow-up questions
+
 const wss = new WebSocketServer({ port: PORT });
-console.log(`🎧 Realtime Transcription Server`);
+console.log(`🎧 Real-Time Interview Server`);
 console.log(`Model: ${MODEL}`);
+console.log(`AI Follow-ups: ${ENABLE_AI_FOLLOWUP ? 'ENABLED ✅' : 'DISABLED ❌'}`);
 console.log(`Port: ws://127.0.0.1:${PORT}\n`);
 
 wss.on('connection', (browser) => {
@@ -33,6 +36,12 @@ wss.on('connection', (browser) => {
   const targetMs = 100;
   let batchBytes = Math.ceil(sampleRateHz * 2 * (targetMs / 1000));
   let sessionReady = false;
+  let hasUncommittedAudio = false;
+  
+  // Follow-up state
+  let currentQuestion = '';
+  let userAnswer = '';
+  let hasAskedFollowup = false;
 
   const recalcBatch = () => {
     batchBytes = Math.ceil(sampleRateHz * 2 * (targetMs / 1000));
@@ -42,6 +51,7 @@ wss.on('connection', (browser) => {
   function resetBuffer() {
     pcmChunks = [];
     pcmBytes = 0;
+    hasUncommittedAudio = false;
   }
 
   function sendAppendIfReady() {
@@ -58,12 +68,11 @@ wss.on('connection', (browser) => {
     }));
   }
 
-  let hasUncommittedAudio = false;
-
   ai.on('open', () => {
     console.log('🤖 Connected to OpenAI Realtime API');
     
-    // ✅ FIXED: Temperature range for gpt-realtime
+    const modalities = ENABLE_AI_FOLLOWUP ? ['text', 'audio'] : ['text'];
+    
     ai.send(JSON.stringify({
       type: 'session.update',
       session: {
@@ -75,18 +84,20 @@ wss.on('connection', (browser) => {
         },
         input_audio_format: 'pcm16',
         output_audio_format: 'pcm16',
-        modalities: ['text', 'audio'],
+        modalities: modalities,
+        voice: 'alloy',
         input_audio_transcription: {
           model: 'whisper-1'
         },
-        // ✅ Try 0.7 (if 0.6 fails, adjust based on model requirements)
-        temperature: 0.7,
-        instructions: 'You are a transcription service. Transcribe exactly what the user says. Do not respond or add commentary.',
-        max_response_output_tokens: 1,
+        temperature: 0.8,
+        max_response_output_tokens: ENABLE_AI_FOLLOWUP ? 50 : 1,
+        instructions: ENABLE_AI_FOLLOWUP 
+          ? 'You are a professional interviewer. When asked, generate ONE brief follow-up question.'
+          : 'You are a transcription service. Transcribe exactly what the user says. Do not respond.',
       },
     }));
     
-    console.log('📤 Session config sent');
+    console.log(`📤 Session configured (Follow-ups: ${ENABLE_AI_FOLLOWUP})`);
   });
 
   ai.on('message', (data, isBinary) => {
@@ -101,22 +112,22 @@ wss.on('connection', (browser) => {
       }
       
       else if (evt.type === 'session.updated') {
-        console.log('✅ Session configured');
-        if (evt.session.input_audio_transcription) {
-          console.log('✅ Transcription enabled:', evt.session.input_audio_transcription.model);
-          sessionReady = true;
-        } else {
-          console.error('❌ Transcription NOT enabled!');
-        }
+        console.log('✅ Session ready');
+        sessionReady = true;
       }
       
-      // Real-time word-by-word transcription
+      // Real-time transcription
       else if (evt.type === 'conversation.item.input_audio_transcription.delta') {
         const text = evt.delta || '';
         if (text) {
           console.log('📝', text);
+          userAnswer += text;
           if (browser.readyState === WebSocket.OPEN) {
-            browser.send(JSON.stringify({ type: 'transcript', delta: text }));
+            browser.send(JSON.stringify({ 
+              type: 'transcript',
+              delta: text,
+              is_partial: true
+            }));
           }
         }
       }
@@ -126,33 +137,68 @@ wss.on('connection', (browser) => {
         const text = evt.transcript || '';
         if (text) {
           console.log('✅ Complete:', text);
+          userAnswer = text;
           if (browser.readyState === WebSocket.OPEN) {
-            browser.send(JSON.stringify({ type: 'transcript', delta: text }));
+            browser.send(JSON.stringify({ 
+              type: 'transcript',
+              delta: text,
+              is_complete: true
+            }));
             browser.send(JSON.stringify({ type: 'transcript_end' }));
           }
+          
+          // Generate follow-up if enabled and not asked yet
+          if (ENABLE_AI_FOLLOWUP && !hasAskedFollowup && userAnswer.length > 30) {
+            setTimeout(() => generateFollowup(), 1000);
+          }
+        }
+      }
+      
+      // AI follow-up response
+      else if (evt.type === 'response.audio.delta' && ENABLE_AI_FOLLOWUP) {
+        if (evt.delta && browser.readyState === WebSocket.OPEN) {
+          browser.send(JSON.stringify({
+            type: 'ai_audio',
+            audio: evt.delta
+          }));
+        }
+      }
+      
+      else if (evt.type === 'response.audio.done' && ENABLE_AI_FOLLOWUP) {
+        console.log('🔊 AI follow-up spoken');
+        if (browser.readyState === WebSocket.OPEN) {
+          browser.send(JSON.stringify({ type: 'ai_audio_done' }));
+        }
+      }
+      
+      else if (evt.type === 'response.text.done' && ENABLE_AI_FOLLOWUP) {
+        const text = evt.text || '';
+        console.log('💬 AI follow-up:', text);
+        if (browser.readyState === WebSocket.OPEN) {
+          browser.send(JSON.stringify({ 
+            type: 'ai_followup',
+            text: text
+          }));
         }
       }
       
       else if (evt.type === 'input_audio_buffer.speech_started') {
         console.log('🎤 Speech started');
         hasUncommittedAudio = true;
+        if (browser.readyState === WebSocket.OPEN) {
+          browser.send(JSON.stringify({ type: 'speech_started' }));
+        }
       }
       
       else if (evt.type === 'input_audio_buffer.speech_stopped') {
         console.log('⏸️ Speech stopped');
+        if (browser.readyState === WebSocket.OPEN) {
+          browser.send(JSON.stringify({ type: 'speech_stopped' }));
+        }
         if (hasUncommittedAudio) {
           ai.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
           hasUncommittedAudio = false;
         }
-      }
-      
-      else if (evt.type === 'session.created') {
-        console.log('📋 Session created');
-      }
-      
-      // Ignore AI response events (we only want transcription)
-      else if (evt.type.startsWith('response.')) {
-        return;
       }
       
     } catch (err) {
@@ -160,7 +206,40 @@ wss.on('connection', (browser) => {
     }
   });
 
-  ai.on('close', (code, reason) => {
+  function generateFollowup() {
+    if (!ENABLE_AI_FOLLOWUP) return;
+    
+    console.log('🤔 Generating follow-up question...');
+    hasAskedFollowup = true;
+    
+    if (browser.readyState === WebSocket.OPEN) {
+      browser.send(JSON.stringify({ type: 'generating_followup' }));
+    }
+    
+    ai.send(JSON.stringify({
+      type: 'conversation.item.create',
+      item: {
+        type: 'message',
+        role: 'user',
+        content: [{
+          type: 'input_text',
+          text: `Question: "${currentQuestion}"\nAnswer: "${userAnswer}"\n\nAsk ONE brief follow-up question (max 15 words).`
+        }]
+      }
+    }));
+    
+    setTimeout(() => {
+      ai.send(JSON.stringify({ 
+        type: 'response.create',
+        response: {
+          modalities: ['text', 'audio'],
+          max_output_tokens: 50
+        }
+      }));
+    }, 100);
+  }
+
+  ai.on('close', () => {
     console.log('🔴 OpenAI disconnected');
     resetBuffer();
     try { browser.close(); } catch {}
@@ -182,10 +261,19 @@ wss.on('connection', (browser) => {
     } else {
       try {
         const evt = JSON.parse(String(msg));
+        
         if (evt?.type === 'config' && typeof evt.sampleRate === 'number') {
           sampleRateHz = evt.sampleRate | 0;
           console.log(`🔧 Sample rate: ${sampleRateHz}Hz`);
           recalcBatch();
+        }
+        
+        // Start new question
+        else if (evt?.type === 'start_question' && evt.question) {
+          console.log(`\n📋 NEW QUESTION: "${evt.question}"\n`);
+          currentQuestion = evt.question;
+          userAnswer = '';
+          hasAskedFollowup = false;
         }
       } catch {}
     }
